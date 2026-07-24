@@ -16,12 +16,21 @@ import certifi
 from config.settings import (
     TWOGIS_API_KEY_ENV,
     TWOGIS_BACKOFF_SECONDS,
+    TWOGIS_DETAILS_ENDPOINT,
+    TWOGIS_DETAILS_RETRY_LIMIT,
+    TWOGIS_DETAILS_TIMEOUT_SECONDS,
     TWOGIS_MAX_RETRIES,
     TWOGIS_PAGE_SIZE,
     TWOGIS_PLACES_ENDPOINT,
     TWOGIS_RATE_LIMIT_DELAY_SECONDS,
     TWOGIS_TIMEOUT_SECONDS,
     TWOGIS_USER_AGENT,
+)
+from enrichment.contact_normalizer import ContactNormalizer
+from enrichment.models import (
+    ContactValue,
+    OrganizationDetails,
+    OrganizationDetailsResult,
 )
 from scanner.models import RawOrganization, SearchPage
 
@@ -30,6 +39,10 @@ ProgressLogger = Callable[[str], None]
 
 class TwoGisClientError(RuntimeError):
     """Raised when the 2GIS Places client cannot return a valid page."""
+
+
+class TwoGisDetailsParserError(TwoGisClientError):
+    """Raised when a 2GIS details payload cannot be normalized."""
 
 
 class MissingTwoGisApiKeyError(TwoGisClientError):
@@ -63,6 +76,7 @@ class TwoGisPlacesClient:
         self.user_agent = user_agent
         self.progress_logger = progress_logger or (lambda message: None)
         self.ssl_context = ssl.create_default_context(cafile=certifi.where())
+        self.contact_normalizer = ContactNormalizer()
 
         if not self.api_key:
             raise MissingTwoGisApiKeyError(
@@ -132,6 +146,105 @@ class TwoGisPlacesClient:
             has_next_page=has_next_page,
         )
 
+    def get_organization_details(
+        self,
+        external_id: str,
+        salon_id: int | None = None,
+    ) -> OrganizationDetailsResult:
+        """Fetch and parse one organization through 2GIS byid."""
+
+        del salon_id
+
+        parameters = {
+            "id": external_id,
+            "locale": "ru_RU",
+            "fields": ",".join(
+                [
+                    "items.point",
+                    "items.address",
+                    "items.full_address_name",
+                    "items.contact_groups",
+                    "items.rubrics",
+                    "items.schedule",
+                    "items.org",
+                    "items.brand",
+                    "items.description",
+                    "items.updated_at",
+                ]
+            ),
+            "key": self.api_key,
+        }
+        url = f"{TWOGIS_DETAILS_ENDPOINT}?{urllib.parse.urlencode(parameters)}"
+        sanitized_source_url = self._build_details_source_url(parameters)
+
+        try:
+            document, http_status = self._request_details_json(
+                url=url,
+                external_id=external_id,
+            )
+            payload_code = self._payload_code(document)
+            self.progress_logger(f"2GIS details payload meta.code: {payload_code}")
+
+            if payload_code == 404:
+                return OrganizationDetailsResult(
+                    external_source="2GIS",
+                    external_id=external_id,
+                    status="not_found",
+                    http_status=http_status,
+                    payload_code=payload_code,
+                    sanitized_source_url=sanitized_source_url,
+                    raw_payload=document,
+                    error_message="2GIS organization not found.",
+                )
+
+            if payload_code in (401, 403):
+                return OrganizationDetailsResult(
+                    external_source="2GIS",
+                    external_id=external_id,
+                    status="unauthorized",
+                    http_status=http_status,
+                    payload_code=payload_code,
+                    sanitized_source_url=sanitized_source_url,
+                    raw_payload=document,
+                    error_message="2GIS details request is unauthorized.",
+                )
+
+            if payload_code is not None and payload_code >= 400:
+                return OrganizationDetailsResult(
+                    external_source="2GIS",
+                    external_id=external_id,
+                    status="provider_error",
+                    http_status=http_status,
+                    payload_code=payload_code,
+                    sanitized_source_url=sanitized_source_url,
+                    raw_payload=document,
+                    error_message=f"2GIS details payload error {payload_code}.",
+                )
+
+            details = self._parse_details(external_id, document)
+
+            return OrganizationDetailsResult(
+                external_source="2GIS",
+                external_id=external_id,
+                status="success",
+                http_status=http_status,
+                payload_code=payload_code,
+                sanitized_source_url=sanitized_source_url,
+                raw_payload=document,
+                details=details,
+            )
+        except TwoGisClientError as error:
+            return OrganizationDetailsResult(
+                external_source="2GIS",
+                external_id=external_id,
+                status=self._details_error_status(error),
+                http_status=getattr(error, "http_status", None),
+                payload_code=None,
+                sanitized_source_url=sanitized_source_url,
+                raw_payload={},
+                error_message=str(error),
+            )
+
     def _request_json(
         self,
         *,
@@ -171,7 +284,82 @@ class TwoGisPlacesClient:
             f"2GIS request failed after retries: {'; '.join(errors)}"
         )
 
+    def _request_details_json(
+        self,
+        *,
+        url: str,
+        external_id: str,
+    ) -> tuple[dict[str, Any], int | None]:
+        errors: list[str] = []
+
+        for attempt in range(1, TWOGIS_DETAILS_RETRY_LIMIT + 1):
+            try:
+                if self.delay_seconds > 0:
+                    time.sleep(self.delay_seconds)
+
+                self.progress_logger(
+                    "2GIS details request "
+                    f"external_id_present={bool(external_id)} "
+                    f"attempt={attempt}/{TWOGIS_DETAILS_RETRY_LIMIT}"
+                )
+                return self._perform_request_with_status(
+                    url,
+                    timeout_seconds=TWOGIS_DETAILS_TIMEOUT_SECONDS,
+                )
+            except urllib.error.HTTPError as error:
+                errors.append(f"HTTP {error.code}")
+
+                if error.code in (401, 403, 404):
+                    raise self._error(
+                        f"2GIS details HTTP {error.code}",
+                        http_status=error.code,
+                    ) from error
+
+                if error.code not in self.RETRYABLE_STATUS_CODES and error.code != 408:
+                    raise self._error(
+                        f"2GIS details HTTP {error.code}",
+                        http_status=error.code,
+                    ) from error
+
+                if attempt >= TWOGIS_DETAILS_RETRY_LIMIT:
+                    raise self._error(
+                        f"2GIS details HTTP {error.code}",
+                        http_status=error.code,
+                    ) from error
+
+                self._sleep_before_retry(
+                    attempt,
+                    error.headers.get("Retry-After"),
+                    max_attempts=TWOGIS_DETAILS_RETRY_LIMIT,
+                )
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                json.JSONDecodeError,
+            ) as error:
+                errors.append(str(error))
+                self._sleep_before_retry(
+                    attempt,
+                    None,
+                    max_attempts=TWOGIS_DETAILS_RETRY_LIMIT,
+                )
+
+        raise TwoGisClientError(
+            f"2GIS details request failed after retries: {'; '.join(errors)}"
+        )
+
     def _perform_request(self, url: str) -> dict[str, Any]:
+        document, _ = self._perform_request_with_status(
+            url,
+            timeout_seconds=self.timeout_seconds,
+        )
+        return document
+
+    def _perform_request_with_status(
+        self,
+        url: str,
+        timeout_seconds: int,
+    ) -> tuple[dict[str, Any], int]:
         request = urllib.request.Request(
             url,
             headers={"User-Agent": self.user_agent},
@@ -180,7 +368,7 @@ class TwoGisPlacesClient:
 
         with urllib.request.urlopen(
             request,
-            timeout=self.timeout_seconds,
+            timeout=timeout_seconds,
             context=self.ssl_context,
         ) as response:
             self.progress_logger(f"2GIS HTTP status: {response.status}")
@@ -192,7 +380,7 @@ class TwoGisPlacesClient:
                     f"{content_type}"
                 )
 
-            return json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8")), int(response.status)
 
     def _build_source_url(self, parameters: dict[str, str]) -> str:
         safe_parameters = {
@@ -202,6 +390,15 @@ class TwoGisPlacesClient:
         }
 
         return f"{self.endpoint_url}?{urllib.parse.urlencode(safe_parameters)}"
+
+    def _build_details_source_url(self, parameters: dict[str, str]) -> str:
+        safe_parameters = {
+            key: value
+            for key, value in parameters.items()
+            if key != "key"
+        }
+
+        return f"{TWOGIS_DETAILS_ENDPOINT}?{urllib.parse.urlencode(safe_parameters)}"
 
     def _normalize_document(self, document: dict[str, Any]) -> dict[str, Any]:
         meta = document.get("meta")
@@ -232,12 +429,146 @@ class TwoGisPlacesClient:
         if isinstance(meta, dict) and "code" in meta:
             self.progress_logger(f"2GIS payload meta.code: {meta['code']}")
 
+    def _payload_code(self, document: dict[str, Any]) -> int | None:
+        meta = document.get("meta")
+
+        if not isinstance(meta, dict) or "code" not in meta:
+            return None
+
+        return int(meta["code"])
+
+    def _parse_details(
+        self,
+        external_id: str,
+        document: dict[str, Any],
+    ) -> OrganizationDetails:
+        result = document.get("result")
+
+        if not isinstance(result, dict):
+            raise TwoGisDetailsParserError(
+                "2GIS details payload has no result object."
+            )
+
+        items = result.get("items")
+
+        if not isinstance(items, list):
+            raise TwoGisDetailsParserError(
+                "2GIS details result.items is not a list."
+            )
+
+        if not items:
+            raise TwoGisDetailsParserError("2GIS details result.items is empty.")
+
+        item = items[0]
+
+        if not isinstance(item, dict):
+            raise TwoGisDetailsParserError(
+                "2GIS details first item is malformed."
+            )
+
+        point = item.get("point") or {}
+        organization = item.get("org") if isinstance(item.get("org"), dict) else {}
+
+        return OrganizationDetails(
+            external_source="2GIS",
+            external_id=external_id,
+            name=self._string_or_none(item.get("name")),
+            full_address=(
+                self._string_or_none(item.get("full_address_name"))
+                or self._extract_address(item)
+            ),
+            latitude=self._optional_float(point.get("lat")),
+            longitude=self._optional_float(point.get("lon")),
+            categories=self._extract_categories(item),
+            description=self._string_or_none(item.get("description")),
+            working_hours=self._json_or_string(item.get("schedule")),
+            branch_info=self._json_or_string(item.get("org")),
+            organization_id=self._string_or_none(organization.get("id")),
+            branch_id=self._string_or_none(item.get("id")),
+            provider_updated_at=self._string_or_none(
+                item.get("updated_at") or item.get("last_update")
+            ),
+            contacts=self._extract_detail_contacts(item),
+        )
+
+    def _extract_detail_contacts(
+        self,
+        item: dict[str, Any],
+    ) -> list[ContactValue]:
+        contacts: list[ContactValue] = []
+        seen: set[tuple[str, str]] = set()
+
+        for group in item.get("contact_groups") or []:
+            if not isinstance(group, dict):
+                continue
+
+            for contact in group.get("contacts") or []:
+                if not isinstance(contact, dict):
+                    continue
+
+                contact_type = str(contact.get("type") or "")
+                value = self._string_or_none(
+                    contact.get("value") or contact.get("text")
+                )
+
+                if value is None:
+                    continue
+
+                normalized = self.contact_normalizer.normalize_contact(
+                    contact_type=contact_type,
+                    value=value,
+                    source="2GIS",
+                    metadata={
+                        "raw_type": contact_type,
+                        "comment": contact.get("comment"),
+                    },
+                )
+
+                if normalized is None:
+                    continue
+
+                key = (normalized.contact_type, normalized.normalized_value)
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+                contacts.append(normalized)
+
+        return contacts
+
+    def _details_error_status(self, error: TwoGisClientError) -> str:
+        if isinstance(error, TwoGisDetailsParserError):
+            return "parser_error"
+
+        http_status = getattr(error, "http_status", None)
+
+        if http_status == 404:
+            return "not_found"
+
+        if http_status in (401, 403):
+            return "unauthorized"
+
+        if http_status == 429:
+            return "rate_limited"
+
+        if http_status in (408, 500, 502, 503, 504):
+            return "transient_error"
+
+        return "provider_error"
+
+    def _error(self, message: str, http_status: int) -> TwoGisClientError:
+        error = TwoGisClientError(message)
+        setattr(error, "http_status", http_status)
+        return error
+
     def _sleep_before_retry(
         self,
         attempt: int,
         retry_after: str | None,
+        max_attempts: int | None = None,
     ) -> None:
-        if attempt >= self.max_retries:
+        if attempt >= (max_attempts or self.max_retries):
             return
 
         seconds = self._retry_after_seconds(retry_after)
@@ -353,5 +684,14 @@ class TwoGisPlacesClient:
     def _string_or_none(self, value: object) -> str | None:
         if value is None:
             return None
+
+        return str(value)
+
+    def _json_or_string(self, value: object) -> str | None:
+        if value is None:
+            return None
+
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
         return str(value)

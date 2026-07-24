@@ -10,7 +10,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from config.regions import REGIONS
-from config.settings import GRID_GENERATOR_VERSION
+from config.settings import DETAIL_PARSER_VERSION, GRID_GENERATOR_VERSION
+from enrichment.models import ContactValue, OrganizationDetails, OrganizationDetailsResult
 from geometry.models import GridCell
 from osm.models import BoundaryRecord
 from scanner.models import ClassificationResult, RawOrganization
@@ -328,6 +329,42 @@ class Database:
                 "updated_at",
                 "TEXT",
             )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "details_enriched_at",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "details_status",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "details_error",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "provider_updated_at",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "organization_id",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "branch_id",
+                "TEXT",
+            )
 
             cursor.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS
@@ -494,6 +531,53 @@ class Database:
             """)
 
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS organization_detail_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    external_source TEXT NOT NULL,
+                    external_id TEXT NOT NULL,
+                    salon_id INTEGER,
+                    fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    http_status INTEGER,
+                    payload_code INTEGER,
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    sanitized_source_url TEXT,
+                    raw_payload_json TEXT NOT NULL,
+                    parser_version TEXT NOT NULL,
+
+                    FOREIGN KEY (salon_id)
+                        REFERENCES salons(id)
+                        ON DELETE SET NULL
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS salon_contacts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    salon_id INTEGER NOT NULL,
+                    contact_type TEXT NOT NULL,
+                    display_value TEXT NOT NULL,
+                    normalized_value TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    metadata_json TEXT,
+
+                    FOREIGN KEY (salon_id)
+                        REFERENCES salons(id)
+                        ON DELETE CASCADE,
+
+                    UNIQUE (
+                        salon_id,
+                        contact_type,
+                        normalized_value,
+                        source
+                    )
+                )
+            """)
+
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS
                 idx_grid_cells_region_status_order
                 ON grid_cells(region_id, status, cell_order)
@@ -545,6 +629,30 @@ class Database:
                 CREATE INDEX IF NOT EXISTS
                 idx_scan_attempts_cell_status
                 ON scan_attempts(grid_cell_id, status)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_detail_results_source_external
+                ON organization_detail_results(external_source, external_id)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_detail_results_salon_status
+                ON organization_detail_results(salon_id, status)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_salon_contacts_salon_type_active
+                ON salon_contacts(salon_id, contact_type, is_active)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_salon_contacts_normalized
+                ON salon_contacts(contact_type, normalized_value)
             """)
 
             connection.commit()
@@ -1646,6 +1754,328 @@ class Database:
                 {**payload, "salon_id": salon_id},
             )
             connection.commit()
+
+    def get_next_salon_for_enrichment(
+        self,
+        refresh_after_days: int | None,
+    ) -> dict[str, Any] | None:
+        """Return the next accepted 2GIS salon needing details enrichment."""
+
+        refresh_clause = ""
+        parameters: list[Any] = []
+
+        if refresh_after_days is not None:
+            refresh_clause = """
+               OR details_enriched_at <= datetime(
+                    'now',
+                    '-' || ? || ' days'
+               )
+            """
+            parameters.append(refresh_after_days)
+
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT *
+                FROM salons
+                WHERE lower(COALESCE(external_source, source, '')) = '2gis'
+                  AND external_id IS NOT NULL
+                  AND trim(external_id) != ''
+                  AND COALESCE(filter_status, 'accepted') = 'accepted'
+                  AND (
+                    details_enriched_at IS NULL
+                    OR details_status IS NULL
+                    OR details_status != 'success'
+                    {refresh_clause}
+                  )
+                ORDER BY id
+                LIMIT 1
+                """,
+                parameters,
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def get_salon_for_enrichment_by_id(
+        self,
+        salon_id: int,
+    ) -> dict[str, Any] | None:
+        """Return one accepted 2GIS salon eligible for details enrichment."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM salons
+                WHERE id = ?
+                  AND lower(COALESCE(external_source, source, '')) = '2gis'
+                  AND external_id IS NOT NULL
+                  AND trim(external_id) != ''
+                  AND COALESCE(filter_status, 'accepted') = 'accepted'
+                """,
+                (salon_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def get_salon_for_enrichment_by_external_id(
+        self,
+        external_id: str,
+    ) -> dict[str, Any] | None:
+        """Return one accepted 2GIS salon by provider organization id."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM salons
+                WHERE lower(COALESCE(external_source, source, '')) = '2gis'
+                  AND external_id = ?
+                  AND COALESCE(filter_status, 'accepted') = 'accepted'
+                ORDER BY id
+                LIMIT 1
+                """,
+                (external_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def save_organization_detail_result(
+        self,
+        salon_id: int | None,
+        result: OrganizationDetailsResult,
+        parser_version: str = DETAIL_PARSER_VERSION,
+    ) -> int:
+        """Append one raw details response and parser status."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO organization_detail_results (
+                    external_source,
+                    external_id,
+                    salon_id,
+                    http_status,
+                    payload_code,
+                    status,
+                    error_message,
+                    sanitized_source_url,
+                    raw_payload_json,
+                    parser_version
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.external_source,
+                    result.external_id,
+                    salon_id,
+                    result.http_status,
+                    result.payload_code,
+                    result.status,
+                    result.error_message,
+                    result.sanitized_source_url,
+                    json.dumps(result.raw_payload, ensure_ascii=False),
+                    parser_version,
+                ),
+            )
+            detail_result_id = int(cursor.lastrowid)
+            connection.commit()
+
+        return detail_result_id
+
+    def apply_organization_details(
+        self,
+        salon_id: int,
+        details: OrganizationDetails,
+    ) -> None:
+        """Merge provider details into the accepted salon record."""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE salons
+                SET
+                    name = COALESCE(?, name),
+                    address = COALESCE(?, address),
+                    normalized_address = COALESCE(?, normalized_address),
+                    latitude = COALESCE(?, latitude),
+                    longitude = COALESCE(?, longitude),
+                    categories = CASE
+                        WHEN ? IS NOT NULL THEN ?
+                        ELSE categories
+                    END,
+                    description = COALESCE(?, description),
+                    organization_id = COALESCE(?, organization_id),
+                    branch_id = COALESCE(?, branch_id),
+                    provider_updated_at = COALESCE(?, provider_updated_at),
+                    details_enriched_at = CURRENT_TIMESTAMP,
+                    details_status = 'success',
+                    details_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    details.name,
+                    details.full_address,
+                    normalize_text(details.full_address),
+                    details.latitude,
+                    details.longitude,
+                    json.dumps(details.categories, ensure_ascii=False)
+                    if details.categories
+                    else None,
+                    json.dumps(details.categories, ensure_ascii=False)
+                    if details.categories
+                    else None,
+                    details.description,
+                    details.organization_id,
+                    details.branch_id,
+                    details.provider_updated_at,
+                    salon_id,
+                ),
+            )
+            connection.commit()
+
+    def mark_salon_details_status(
+        self,
+        salon_id: int,
+        status: str,
+        error: str | None,
+    ) -> None:
+        """Store the latest details enrichment status for one salon."""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE salons
+                SET
+                    details_enriched_at = CURRENT_TIMESTAMP,
+                    details_status = ?,
+                    details_error = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, error, salon_id),
+            )
+            connection.commit()
+
+    def upsert_salon_contacts(
+        self,
+        salon_id: int,
+        contacts: list[ContactValue],
+        source: str,
+    ) -> tuple[int, int, int]:
+        """Merge normalized contacts and mark disappeared contacts inactive."""
+
+        created = 0
+        updated = 0
+        seen_keys = {
+            (contact.contact_type, contact.normalized_value, contact.source)
+            for contact in contacts
+        }
+
+        with self.connect() as connection:
+            for contact in contacts:
+                existing = connection.execute(
+                    """
+                    SELECT id
+                    FROM salon_contacts
+                    WHERE salon_id = ?
+                      AND contact_type = ?
+                      AND normalized_value = ?
+                      AND source = ?
+                    """,
+                    (
+                        salon_id,
+                        contact.contact_type,
+                        contact.normalized_value,
+                        contact.source,
+                    ),
+                ).fetchone()
+                connection.execute(
+                    """
+                    INSERT INTO salon_contacts (
+                        salon_id,
+                        contact_type,
+                        display_value,
+                        normalized_value,
+                        source,
+                        is_active,
+                        metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, 1, ?)
+                    ON CONFLICT (
+                        salon_id,
+                        contact_type,
+                        normalized_value,
+                        source
+                    )
+                    DO UPDATE SET
+                        display_value = excluded.display_value,
+                        last_seen_at = CURRENT_TIMESTAMP,
+                        is_active = 1,
+                        metadata_json = excluded.metadata_json
+                    """,
+                    (
+                        salon_id,
+                        contact.contact_type,
+                        contact.display_value,
+                        contact.normalized_value,
+                        contact.source,
+                        json.dumps(contact.metadata, ensure_ascii=False),
+                    ),
+                )
+
+                if existing is None:
+                    created += 1
+                else:
+                    updated += 1
+
+            active_rows = connection.execute(
+                """
+                SELECT id, contact_type, normalized_value, source
+                FROM salon_contacts
+                WHERE salon_id = ?
+                  AND source = ?
+                  AND is_active = 1
+                """,
+                (salon_id, source),
+            ).fetchall()
+            deactivate_ids = [
+                int(row["id"])
+                for row in active_rows
+                if (
+                    row["contact_type"],
+                    row["normalized_value"],
+                    row["source"],
+                )
+                not in seen_keys
+            ]
+
+            if deactivate_ids:
+                placeholders = ",".join("?" for _ in deactivate_ids)
+                connection.execute(
+                    f"""
+                    UPDATE salon_contacts
+                    SET
+                        is_active = 0,
+                        last_seen_at = CURRENT_TIMESTAMP
+                    WHERE id IN ({placeholders})
+                    """,
+                    deactivate_ids,
+                )
+
+            connection.commit()
+
+        return created, updated, len(deactivate_ids)
 
     def get_table_names(self) -> list[str]:
         with self.connect() as connection:
