@@ -138,3 +138,13 @@ PRICING_USER_AGENT = (
 )
 
 PRICE_PARSER_VERSION = "1.0.0"
+
+# ================================
+# Reclassification
+# ================================
+
+RECLASSIFICATION_DRY_RUN = True
+
+RECLASSIFICATION_MAX_RECORDS_PER_RUN = 25
+
+SALON_CLASSIFIER_VERSION = "2.0.0"

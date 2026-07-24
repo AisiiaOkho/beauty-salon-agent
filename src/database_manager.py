@@ -10,7 +10,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from config.regions import REGIONS
-from config.settings import DETAIL_PARSER_VERSION, GRID_GENERATOR_VERSION
+from config.settings import (
+    DETAIL_PARSER_VERSION,
+    GRID_GENERATOR_VERSION,
+    SALON_CLASSIFIER_VERSION,
+)
 from enrichment.models import ContactValue, OrganizationDetails, OrganizationDetailsResult
 from geometry.models import GridCell
 from osm.models import BoundaryRecord
@@ -369,6 +373,18 @@ class Database:
                 "branch_id",
                 "TEXT",
             )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "classifier_version",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "classified_at",
+                "TEXT",
+            )
 
             cursor.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS
@@ -633,6 +649,24 @@ class Database:
             """)
 
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS salon_classification_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    salon_id INTEGER NOT NULL,
+                    classified_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    classifier_version TEXT NOT NULL,
+                    accepted INTEGER NOT NULL,
+                    business_profile TEXT,
+                    reason_codes_json TEXT NOT NULL,
+                    rejection_reason TEXT,
+                    input_snapshot_json TEXT NOT NULL,
+
+                    FOREIGN KEY (salon_id)
+                        REFERENCES salons(id)
+                        ON DELETE CASCADE
+                )
+            """)
+
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS
                 idx_grid_cells_region_status_order
                 ON grid_cells(region_id, status, cell_order)
@@ -720,6 +754,12 @@ class Database:
                 CREATE INDEX IF NOT EXISTS
                 idx_salon_prices_salon_service_active
                 ON salon_prices(salon_id, service_key, is_active)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_classification_results_salon_version
+                ON salon_classification_results(salon_id, classifier_version)
             """)
 
             connection.commit()
@@ -1865,6 +1905,126 @@ class Database:
             return None
 
         return dict(row)
+
+    def get_salons_for_reclassification(
+        self,
+        max_records: int,
+        salon_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return salon rows with preserved classifier input fields."""
+
+        parameters: list[Any] = []
+        where_clause = ""
+
+        if salon_id is not None:
+            where_clause = "WHERE id = ?"
+            parameters.append(salon_id)
+
+        parameters.append(max_records)
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM salons
+                {where_clause}
+                ORDER BY id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+
+        return [dict(row) for row in rows]
+
+    def save_salon_classification_result(
+        self,
+        salon_id: int,
+        classification: ClassificationResult,
+        input_snapshot: dict[str, Any],
+        classifier_version: str = SALON_CLASSIFIER_VERSION,
+    ) -> int:
+        """Append one classification audit result and update current state."""
+
+        filter_status = "accepted" if classification.accepted else "rejected"
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO salon_classification_results (
+                    salon_id,
+                    classifier_version,
+                    accepted,
+                    business_profile,
+                    reason_codes_json,
+                    rejection_reason,
+                    input_snapshot_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    salon_id,
+                    classifier_version,
+                    1 if classification.accepted else 0,
+                    classification.business_profile,
+                    json.dumps(classification.reason_codes, ensure_ascii=False),
+                    classification.rejection_reason,
+                    json.dumps(input_snapshot, ensure_ascii=False),
+                ),
+            )
+            result_id = int(cursor.lastrowid)
+            connection.execute(
+                """
+                UPDATE salons
+                SET
+                    filter_status = ?,
+                    filter_confidence = ?,
+                    filter_reasons = ?,
+                    classifier_reason_codes = ?,
+                    rejection_reason = ?,
+                    business_profile = ?,
+                    classifier_decision_name = ?,
+                    classifier_decision_categories = ?,
+                    salon_type = ?,
+                    manicure_confirmed = ?,
+                    classifier_version = ?,
+                    classified_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    filter_status,
+                    classification.confidence,
+                    json.dumps(classification.reasons, ensure_ascii=False),
+                    json.dumps(classification.reason_codes, ensure_ascii=False),
+                    classification.rejection_reason,
+                    classification.business_profile,
+                    classification.decision_name,
+                    json.dumps(
+                        classification.decision_categories,
+                        ensure_ascii=False,
+                    ),
+                    classification.salon_type,
+                    1 if classification.accepted else 0,
+                    classifier_version,
+                    salon_id,
+                ),
+            )
+            connection.commit()
+
+        return result_id
+
+    def get_classification_audit_count(self) -> int:
+        """Return total classification audit rows."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM salon_classification_results
+                """
+            ).fetchone()
+
+        return int(row["total"])
 
     def get_salon_for_enrichment_by_id(
         self,
