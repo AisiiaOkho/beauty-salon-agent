@@ -327,6 +327,63 @@ class RetryTwoGisClient(TwoGisPlacesClient):
         return {"result": {"items": [], "total": 0}}
 
 
+class EmptyResultTwoGisClient(TwoGisPlacesClient):
+    def __init__(self) -> None:
+        super().__init__(
+            api_key="test",
+            delay_seconds=0,
+            progress_logger=lambda message: None,
+        )
+
+    def _perform_request(self, url: str) -> dict[str, object]:
+        return {
+            "meta": {
+                "code": 404,
+                "error": {"message": "Results not found"},
+            }
+        }
+
+
+class RealShapeTwoGisClient(TwoGisPlacesClient):
+    def __init__(self) -> None:
+        super().__init__(
+            api_key="test",
+            delay_seconds=0,
+            progress_logger=lambda message: None,
+        )
+
+    def _perform_request(self, url: str) -> dict[str, object]:
+        return {
+            "meta": {"code": 200},
+            "result": {
+                "total": 1,
+                "items": [
+                    {
+                        "id": "70000000000000000",
+                        "name": "Тестовая студия маникюра",
+                        "type": "branch",
+                        "address": {
+                            "building_id": "1",
+                            "components": [],
+                            "postcode": "236000",
+                        },
+                        "address_name": "Тестовая, 1",
+                        "point": {"lat": 54.71, "lon": 20.45},
+                        "rubrics": [
+                            {
+                                "id": "1",
+                                "name": "Ногтевые студии",
+                                "alias": "nail_studios",
+                            }
+                        ],
+                        "schedule": {},
+                        "org": {},
+                    }
+                ],
+            },
+        }
+
+
 class TwoGisClientTests(unittest.TestCase):
     def test_retry_behavior(self) -> None:
         client = RetryTwoGisClient()
@@ -342,6 +399,37 @@ class TwoGisClientTests(unittest.TestCase):
 
         self.assertEqual(page.organizations, [])
         self.assertEqual(client.calls, 2)
+
+    def test_payload_404_results_not_found_is_empty_page(self) -> None:
+        client = EmptyResultTwoGisClient()
+
+        page = client.search(
+            query="маникюр",
+            center_lat=54.71,
+            center_lon=20.50,
+            radius_meters=1100,
+            page=1,
+            grid_cell_id=1,
+        )
+
+        self.assertEqual(page.organizations, [])
+        self.assertFalse(page.has_next_page)
+
+    def test_real_shape_address_name_is_parsed(self) -> None:
+        client = RealShapeTwoGisClient()
+
+        page = client.search(
+            query="маникюр",
+            center_lat=54.71,
+            center_lon=20.50,
+            radius_meters=1100,
+            page=1,
+            grid_cell_id=1,
+        )
+
+        self.assertEqual(page.organizations[0].address, "Тестовая, 1")
+        self.assertEqual(page.organizations[0].categories, ["Ногтевые студии"])
+        self.assertEqual(page.organizations[0].external_id, "70000000000000000")
 
 
 if __name__ == "__main__":

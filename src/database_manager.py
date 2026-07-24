@@ -259,6 +259,36 @@ class Database:
             self._add_column_if_missing(
                 cursor,
                 "salons",
+                "classifier_reason_codes",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "rejection_reason",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "business_profile",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "classifier_decision_name",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
+                "classifier_decision_categories",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salons",
                 "raw_payload",
                 "TEXT",
             )
@@ -408,6 +438,36 @@ class Database:
                         ON DELETE CASCADE
                 )
             """)
+            self._add_column_if_missing(
+                cursor,
+                "salon_discoveries",
+                "classifier_reason_codes",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salon_discoveries",
+                "rejection_reason",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salon_discoveries",
+                "business_profile",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salon_discoveries",
+                "classifier_decision_name",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "salon_discoveries",
+                "classifier_decision_categories",
+                "TEXT",
+            )
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS scan_attempts (
@@ -1269,6 +1329,11 @@ class Database:
                     filter_status,
                     filter_confidence,
                     filter_reasons,
+                    classifier_reason_codes,
+                    rejection_reason,
+                    business_profile,
+                    classifier_decision_name,
+                    classifier_decision_categories,
                     manicure_confirmed,
                     verification_status,
                     raw_payload,
@@ -1298,6 +1363,11 @@ class Database:
                     :filter_status,
                     :filter_confidence,
                     :filter_reasons,
+                    :classifier_reason_codes,
+                    :rejection_reason,
+                    :business_profile,
+                    :classifier_decision_name,
+                    :classifier_decision_categories,
                     1,
                     'not_checked',
                     :raw_payload,
@@ -1337,9 +1407,14 @@ class Database:
                     external_id,
                     filter_status,
                     filter_confidence,
-                    filter_reasons
+                    filter_reasons,
+                    classifier_reason_codes,
+                    rejection_reason,
+                    business_profile,
+                    classifier_decision_name,
+                    classifier_decision_categories
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     salon_id,
@@ -1352,6 +1427,14 @@ class Database:
                     "accepted" if classification.accepted else "rejected",
                     classification.confidence,
                     json.dumps(classification.reasons, ensure_ascii=False),
+                    json.dumps(classification.reason_codes, ensure_ascii=False),
+                    classification.rejection_reason,
+                    classification.business_profile,
+                    classification.decision_name,
+                    json.dumps(
+                        classification.decision_categories,
+                        ensure_ascii=False,
+                    ),
                 ),
             )
             connection.commit()
@@ -1496,6 +1579,17 @@ class Database:
                 classification.reasons,
                 ensure_ascii=False,
             ),
+            "classifier_reason_codes": json.dumps(
+                classification.reason_codes,
+                ensure_ascii=False,
+            ),
+            "rejection_reason": classification.rejection_reason,
+            "business_profile": classification.business_profile,
+            "classifier_decision_name": classification.decision_name,
+            "classifier_decision_categories": json.dumps(
+                classification.decision_categories,
+                ensure_ascii=False,
+            ),
             "raw_payload": json.dumps(
                 organization.raw_payload,
                 ensure_ascii=False,
@@ -1536,6 +1630,11 @@ class Database:
                     filter_status = :filter_status,
                     filter_confidence = :filter_confidence,
                     filter_reasons = :filter_reasons,
+                    classifier_reason_codes = :classifier_reason_codes,
+                    rejection_reason = :rejection_reason,
+                    business_profile = :business_profile,
+                    classifier_decision_name = :classifier_decision_name,
+                    classifier_decision_categories = :classifier_decision_categories,
                     manicure_confirmed = 1,
                     raw_payload = :raw_payload,
                     source_url = COALESCE(:source_url, source_url),

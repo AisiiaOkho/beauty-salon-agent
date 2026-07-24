@@ -43,8 +43,29 @@ class ClassificationResult:
 
     accepted: bool
     confidence: float
-    reasons: list[str]
-    salon_type: str
+    reason_codes: list[str]
+    business_profile: str = "unknown"
+    rejection_reason: str | None = None
+    decision_name: str | None = None
+    decision_categories: list[str] = field(default_factory=list)
+
+    @property
+    def reasons(self) -> list[str]:
+        """Backward-compatible alias for older persistence code/tests."""
+
+        return self.reason_codes
+
+    @property
+    def salon_type(self) -> str:
+        """Backward-compatible accepted salon profile value."""
+
+        if self.business_profile == "nail_specialist":
+            return "manicure_specialized"
+
+        if self.business_profile == "mixed_beauty_salon":
+            return "mixed_beauty_salon"
+
+        return "unknown"
 
 
 @dataclass

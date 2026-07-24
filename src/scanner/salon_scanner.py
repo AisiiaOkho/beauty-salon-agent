@@ -122,6 +122,14 @@ class SalonScannerManager:
                         page=page,
                         grid_cell_id=grid_cell_id,
                     )
+                    self.progress_logger(
+                        "2GIS page parsed: "
+                        f"cell={cell['cell_order']} "
+                        f"query='{query}' "
+                        f"page={page} "
+                        f"organizations={len(result_page.organizations)} "
+                        f"has_next={result_page.has_next_page}"
+                    )
                     organizations_found_in_cell += len(
                         result_page.organizations
                     )

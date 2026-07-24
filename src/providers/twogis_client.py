@@ -103,7 +103,11 @@ class TwoGisPlacesClient:
             "key": self.api_key,
         }
         url = f"{self.endpoint_url}?{urllib.parse.urlencode(parameters)}"
-        document = self._request_json(url=url, query=query, page=page)
+        source_url = self._build_source_url(parameters)
+        document = self._normalize_document(
+            self._request_json(url=url, query=query, page=page)
+        )
+        self._log_meta_code(document)
         items = document.get("result", {}).get("items", [])
 
         if not isinstance(items, list):
@@ -112,7 +116,7 @@ class TwoGisPlacesClient:
         organizations = [
             self._parse_item(
                 item=item,
-                source_url=url,
+                source_url=source_url,
                 query=query,
                 grid_cell_id=grid_cell_id,
             )
@@ -179,6 +183,7 @@ class TwoGisPlacesClient:
             timeout=self.timeout_seconds,
             context=self.ssl_context,
         ) as response:
+            self.progress_logger(f"2GIS HTTP status: {response.status}")
             content_type = response.headers.get("Content-Type", "")
 
             if "json" not in content_type.lower():
@@ -188,6 +193,44 @@ class TwoGisPlacesClient:
                 )
 
             return json.loads(response.read().decode("utf-8"))
+
+    def _build_source_url(self, parameters: dict[str, str]) -> str:
+        safe_parameters = {
+            key: value
+            for key, value in parameters.items()
+            if key != "key"
+        }
+
+        return f"{self.endpoint_url}?{urllib.parse.urlencode(safe_parameters)}"
+
+    def _normalize_document(self, document: dict[str, Any]) -> dict[str, Any]:
+        meta = document.get("meta")
+
+        if isinstance(meta, dict):
+            code = meta.get("code")
+
+            if int(code or 0) == 404:
+                return {
+                    **document,
+                    "result": {"items": [], "total": 0},
+                }
+
+            if code is not None and int(code) >= 400:
+                message = meta.get("error", {}).get("message")
+                raise TwoGisClientError(
+                    f"2GIS API error {code}: {message or 'unknown error'}"
+                )
+
+        if "result" not in document:
+            raise TwoGisClientError("2GIS response does not contain result.")
+
+        return document
+
+    def _log_meta_code(self, document: dict[str, Any]) -> None:
+        meta = document.get("meta")
+
+        if isinstance(meta, dict) and "code" in meta:
+            self.progress_logger(f"2GIS payload meta.code: {meta['code']}")
 
     def _sleep_before_retry(
         self,
@@ -250,9 +293,11 @@ class TwoGisPlacesClient:
         address = item.get("address")
 
         if isinstance(address, dict):
-            return self._string_or_none(address.get("name"))
+            return self._string_or_none(
+                address.get("name") or item.get("address_name")
+            )
 
-        return self._string_or_none(address)
+        return self._string_or_none(address or item.get("address_name"))
 
     def _extract_categories(self, item: dict[str, Any]) -> list[str]:
         rubrics = item.get("rubrics") or []
