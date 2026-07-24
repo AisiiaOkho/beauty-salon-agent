@@ -115,3 +115,26 @@ ENRICHMENT_MAX_ORGANIZATIONS_PER_RUN = 1
 ENRICHMENT_REFRESH_AFTER_DAYS = 30
 
 DETAIL_PARSER_VERSION = "1.0.0"
+
+# ================================
+# Pricing
+# ================================
+
+PRICING_DRY_RUN = True
+
+PRICING_MAX_SALONS_PER_RUN = 1
+
+PRICING_MAX_PAGES_PER_SALON = 4
+
+PRICING_TIMEOUT_SECONDS = 15
+
+PRICING_MAX_RESPONSE_BYTES = 1_000_000
+
+PRICING_RETRY_LIMIT = 2
+
+PRICING_USER_AGENT = (
+    "BeautySalonAgent/1.0 "
+    "(manicure-price-extractor; contact: local-operator)"
+)
+
+PRICE_PARSER_VERSION = "1.0.0"

@@ -13,6 +13,7 @@ Production-oriented scanner for beauty and nail salons across Russian regions.
 - Resumable 2GIS salon scanning pipeline behind a provider interface.
 - Deterministic manicure-salon classifier and duplicate merging.
 - Controlled 2GIS organization-details enrichment for accepted salons.
+- Deterministic manicure price extraction with evidence tracking.
 
 ## Setup
 
@@ -73,6 +74,38 @@ PYTHONPATH=src python3 src/enrich.py --live --max 1
 The normal application command, `python src/main.py`, still performs grid
 creation and scanner orchestration only; details enrichment is intentionally a
 separate controlled step.
+
+## Price Extraction
+
+Module 6 extracts the target service price, "basic manicure with coating",
+only from structured provider evidence already saved in SQLite or directly
+attributable content from a salon's saved website URL. It does not scrape
+social networks, run browser automation, use search engines, or infer prices
+from unrelated services.
+
+The default development settings are safe:
+
+```python
+PRICING_DRY_RUN = True
+PRICING_MAX_SALONS_PER_RUN = 1
+PRICING_MAX_PAGES_PER_SALON = 4
+```
+
+Run a dry-run preview:
+
+```bash
+python3 src/prices.py
+```
+
+Run one controlled live website/provider extraction:
+
+```bash
+python3 src/prices.py --live --max 1
+```
+
+Pricing writes append-only audit rows to `price_check_results` and maintains
+the current active target price in `salon_prices`. If no reliable target price
+is found, it records a clear `not_found` result rather than guessing.
 
 ## Boundary Cache
 

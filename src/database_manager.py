@@ -14,6 +14,10 @@ from config.settings import DETAIL_PARSER_VERSION, GRID_GENERATOR_VERSION
 from enrichment.models import ContactValue, OrganizationDetails, OrganizationDetailsResult
 from geometry.models import GridCell
 from osm.models import BoundaryRecord
+from pricing.models import (
+    SERVICE_KEY_BASIC_MANICURE_WITH_COATING,
+    PriceExtractionResult,
+)
 from scanner.models import ClassificationResult, RawOrganization
 from utils.normalization import coordinate_key, normalize_phone, normalize_text
 
@@ -578,6 +582,57 @@ class Database:
             """)
 
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS price_check_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    salon_id INTEGER NOT NULL,
+                    checked_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT NOT NULL,
+                    source_type TEXT,
+                    sanitized_source_url TEXT,
+                    raw_evidence_json TEXT NOT NULL,
+                    error_message TEXT,
+                    parser_version TEXT NOT NULL,
+
+                    FOREIGN KEY (salon_id)
+                        REFERENCES salons(id)
+                        ON DELETE CASCADE
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS salon_prices (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    salon_id INTEGER NOT NULL,
+                    service_key TEXT NOT NULL,
+                    service_name_raw TEXT,
+                    service_name_normalized TEXT,
+                    amount_minor INTEGER,
+                    currency TEXT,
+                    price_type TEXT NOT NULL,
+                    range_min_minor INTEGER,
+                    range_max_minor INTEGER,
+                    source_type TEXT,
+                    source_url TEXT,
+                    evidence_text TEXT,
+                    confidence TEXT NOT NULL,
+                    first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    last_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+
+                    FOREIGN KEY (salon_id)
+                        REFERENCES salons(id)
+                        ON DELETE CASCADE,
+
+                    UNIQUE (
+                        salon_id,
+                        service_key,
+                        source_type,
+                        evidence_text
+                    )
+                )
+            """)
+
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS
                 idx_grid_cells_region_status_order
                 ON grid_cells(region_id, status, cell_order)
@@ -653,6 +708,18 @@ class Database:
                 CREATE INDEX IF NOT EXISTS
                 idx_salon_contacts_normalized
                 ON salon_contacts(contact_type, normalized_value)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_price_check_results_salon_status
+                ON price_check_results(salon_id, status)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_salon_prices_salon_service_active
+                ON salon_prices(salon_id, service_key, is_active)
             """)
 
             connection.commit()
@@ -2076,6 +2143,344 @@ class Database:
             connection.commit()
 
         return created, updated, len(deactivate_ids)
+
+    def get_next_salon_for_pricing(self) -> dict[str, Any] | None:
+        """Return the next accepted salon needing a pricing check."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM salons
+                WHERE COALESCE(filter_status, 'accepted') = 'accepted'
+                ORDER BY
+                    CASE
+                        WHEN verification_status = 'not_checked' THEN 0
+                        ELSE 1
+                    END,
+                    id
+                LIMIT 1
+                """
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def get_salon_for_pricing_by_id(
+        self,
+        salon_id: int,
+    ) -> dict[str, Any] | None:
+        """Return one accepted salon for controlled pricing extraction."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM salons
+                WHERE id = ?
+                  AND COALESCE(filter_status, 'accepted') = 'accepted'
+                """,
+                (salon_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def get_latest_detail_payloads_for_pricing(
+        self,
+        salon_id: int,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return recent successful details payloads for structured price parsing."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT raw_payload_json, sanitized_source_url
+                FROM organization_detail_results
+                WHERE salon_id = ?
+                  AND status = 'success'
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (salon_id, limit),
+            ).fetchall()
+
+        payloads: list[dict[str, Any]] = []
+
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_payload_json"])
+            except json.JSONDecodeError:
+                continue
+
+            payloads.append(
+                {
+                    "payload": payload,
+                    "source_url": row["sanitized_source_url"],
+                }
+            )
+
+        return payloads
+
+    def save_price_check_result(
+        self,
+        result: PriceExtractionResult,
+    ) -> int:
+        """Append one price extraction audit result."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO price_check_results (
+                    salon_id,
+                    checked_at,
+                    status,
+                    source_type,
+                    sanitized_source_url,
+                    raw_evidence_json,
+                    error_message,
+                    parser_version
+                )
+                VALUES (?, COALESCE(?, CURRENT_TIMESTAMP), ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.salon_id,
+                    result.checked_at,
+                    result.extraction_status,
+                    result.source_type,
+                    result.source_url,
+                    json.dumps(result.raw_evidence, ensure_ascii=False),
+                    result.error_message,
+                    result.parser_version,
+                ),
+            )
+            check_id = int(cursor.lastrowid)
+            connection.commit()
+
+        return check_id
+
+    def upsert_salon_price(
+        self,
+        result: PriceExtractionResult,
+    ) -> tuple[int | None, bool]:
+        """Persist current price state while keeping audit history append-only."""
+
+        if result.extraction_status not in ("found", "ambiguous"):
+            self._mark_missing_price_result(result)
+            return None, False
+
+        evidence_text = result.evidence_text or ""
+
+        with self.connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id
+                FROM salon_prices
+                WHERE salon_id = ?
+                  AND service_key = ?
+                  AND COALESCE(source_type, '') = COALESCE(?, '')
+                  AND COALESCE(evidence_text, '') = COALESCE(?, '')
+                LIMIT 1
+                """,
+                (
+                    result.salon_id,
+                    result.service_key,
+                    result.source_type,
+                    evidence_text,
+                ),
+            ).fetchone()
+            connection.execute(
+                """
+                UPDATE salon_prices
+                SET
+                    is_active = 0,
+                    last_seen_at = CURRENT_TIMESTAMP
+                WHERE salon_id = ?
+                  AND service_key = ?
+                  AND is_active = 1
+                  AND NOT (
+                    COALESCE(source_type, '') = COALESCE(?, '')
+                    AND COALESCE(evidence_text, '') = COALESCE(?, '')
+                  )
+                """,
+                (
+                    result.salon_id,
+                    result.service_key,
+                    result.source_type,
+                    evidence_text,
+                ),
+            )
+            cursor = connection.execute(
+                """
+                INSERT INTO salon_prices (
+                    salon_id,
+                    service_key,
+                    service_name_raw,
+                    service_name_normalized,
+                    amount_minor,
+                    currency,
+                    price_type,
+                    range_min_minor,
+                    range_max_minor,
+                    source_type,
+                    source_url,
+                    evidence_text,
+                    confidence,
+                    is_active
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ON CONFLICT (
+                    salon_id,
+                    service_key,
+                    source_type,
+                    evidence_text
+                )
+                DO UPDATE SET
+                    service_name_raw = excluded.service_name_raw,
+                    service_name_normalized = excluded.service_name_normalized,
+                    amount_minor = excluded.amount_minor,
+                    currency = excluded.currency,
+                    price_type = excluded.price_type,
+                    range_min_minor = excluded.range_min_minor,
+                    range_max_minor = excluded.range_max_minor,
+                    source_url = excluded.source_url,
+                    confidence = excluded.confidence,
+                    last_seen_at = CURRENT_TIMESTAMP,
+                    is_active = 1
+                """,
+                (
+                    result.salon_id,
+                    result.service_key,
+                    result.service_name_raw,
+                    result.service_name_normalized,
+                    result.amount_minor,
+                    result.currency,
+                    result.price_type,
+                    result.range_min_minor,
+                    result.range_max_minor,
+                    result.source_type,
+                    result.source_url,
+                    evidence_text,
+                    result.confidence,
+                ),
+            )
+            price_id = (
+                int(existing["id"])
+                if existing is not None
+                else int(cursor.lastrowid)
+            )
+            self._update_salon_price_summary(connection, result)
+            connection.commit()
+
+        return price_id, existing is not None
+
+    def _mark_missing_price_result(
+        self,
+        result: PriceExtractionResult,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE salon_prices
+                SET
+                    is_active = 0,
+                    last_seen_at = CURRENT_TIMESTAMP
+                WHERE salon_id = ?
+                  AND service_key = ?
+                  AND is_active = 1
+                """,
+                (result.salon_id, result.service_key),
+            )
+            connection.execute(
+                """
+                UPDATE salons
+                SET
+                    verification_status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (result.extraction_status, result.salon_id),
+            )
+            connection.commit()
+
+    def _update_salon_price_summary(
+        self,
+        connection: sqlite3.Connection,
+        result: PriceExtractionResult,
+    ) -> None:
+        if result.extraction_status != "found":
+            connection.execute(
+                """
+                UPDATE salons
+                SET
+                    verification_status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (result.extraction_status, result.salon_id),
+            )
+            return
+
+        price_min = None
+        price_max = None
+
+        if result.price_type == "range":
+            price_min = (
+                result.range_min_minor // 100
+                if result.range_min_minor is not None
+                else None
+            )
+            price_max = (
+                result.range_max_minor // 100
+                if result.range_max_minor is not None
+                else None
+            )
+        elif result.amount_minor is not None:
+            price_min = result.amount_minor // 100
+            price_max = result.amount_minor // 100
+
+        connection.execute(
+            """
+            UPDATE salons
+            SET
+                service_name = ?,
+                service_price = ?,
+                price_min = ?,
+                price_max = ?,
+                price_source = ?,
+                price_source_url = ?,
+                verification_status = 'price_found',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                result.service_name_raw,
+                self._display_price(result),
+                price_min,
+                price_max,
+                result.source_type,
+                result.source_url,
+                result.salon_id,
+            ),
+        )
+
+    def _display_price(self, result: PriceExtractionResult) -> str | None:
+        if result.price_type == "range":
+            if result.range_min_minor is None or result.range_max_minor is None:
+                return None
+
+            return f"{result.range_min_minor // 100}-{result.range_max_minor // 100}"
+
+        if result.amount_minor is None:
+            return None
+
+        prefix = "от " if result.price_type == "from" else ""
+        return f"{prefix}{result.amount_minor // 100}"
 
     def get_table_names(self) -> list[str]:
         with self.connect() as connection:
