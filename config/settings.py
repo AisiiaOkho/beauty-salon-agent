@@ -148,3 +148,13 @@ RECLASSIFICATION_DRY_RUN = True
 RECLASSIFICATION_MAX_RECORDS_PER_RUN = 25
 
 SALON_CLASSIFIER_VERSION = "2.0.0"
+
+# ================================
+# Export
+# ================================
+
+EXPORT_DRY_RUN = True
+
+EXPORT_INCLUDE_REJECTED = True
+
+EXPORT_OUTPUT_DIR = "exports"
