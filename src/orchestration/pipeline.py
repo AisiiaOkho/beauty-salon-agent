@@ -119,6 +119,7 @@ class AgentPipeline:
                     metrics={
                         "next_cell_id": next_cell["id"] if next_cell else None,
                         "next_cell_order": next_cell["cell_order"] if next_cell else None,
+                        "query_profile_name": self.config.query_profile_name,
                     },
                 ),
                 StageResult(
@@ -257,6 +258,7 @@ class AgentPipeline:
             max_cells_per_run=self.config.max_cells_per_run,
             dry_run=False,
             target_cell_ids=self.config.target_cell_ids,
+            query_profile_name=self.config.query_profile_name,
             progress_logger=self.progress_logger,
         )
         scan_summary = scanner.scan_region(region)

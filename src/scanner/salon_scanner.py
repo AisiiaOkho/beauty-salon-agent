@@ -8,7 +8,6 @@ from config.settings import (
     SCANNER_CELL_RETRY_LIMIT,
     SCANNER_DRY_RUN,
     SCANNER_MAX_CELLS_PER_RUN,
-    SEARCH_QUERIES,
     TWOGIS_MAX_PAGES_PER_QUERY,
 )
 from database_manager import Database
@@ -16,6 +15,7 @@ from filters.salon_classifier import SalonClassifier
 from providers.search_client import OrganizationSearchClient
 from providers.twogis_client import MissingTwoGisApiKeyError, TwoGisPlacesClient
 from scanner.models import ClassificationResult, RawOrganization, ScanSummary
+from scanner.query_profiles import resolve_query_profile
 
 ProgressLogger = Callable[[str], None]
 
@@ -33,6 +33,8 @@ class SalonScannerManager:
         retry_limit: int = SCANNER_CELL_RETRY_LIMIT,
         dry_run: bool = SCANNER_DRY_RUN,
         target_cell_ids: list[int] | None = None,
+        query_profile_name: str | None = None,
+        queries: list[str] | tuple[str, ...] | None = None,
         progress_logger: ProgressLogger | None = None,
     ) -> None:
         if max_cells_per_run < 0:
@@ -48,6 +50,8 @@ class SalonScannerManager:
         self.retry_limit = retry_limit
         self.dry_run = dry_run
         self.target_cell_ids = target_cell_ids
+        self.query_profile = resolve_query_profile(query_profile_name, queries)
+        self.queries = list(self.query_profile.queries)
         self.progress_logger = progress_logger or print
         self.search_client = search_client
 
@@ -108,12 +112,14 @@ class SalonScannerManager:
         attempt_id = self.database.create_scan_attempt(
             region_id=region_id,
             grid_cell_id=grid_cell_id,
+            query_profile_name=self.query_profile.name,
+            query_snapshot=self.queries,
         )
         summary = ScanSummary(cells_processed=1)
         organizations_found_in_cell = 0
 
         try:
-            for query in SEARCH_QUERIES:
+            for query in self.queries:
                 page = 1
 
                 while page <= self.max_pages_per_query:
@@ -187,13 +193,16 @@ class SalonScannerManager:
         )
         classification = self.classifier.classify(organization)
 
-        if classification.accepted:
+        if classification.accepted or organization.external_id:
             salon_id, merged = self.database.upsert_salon(
                 region_id=region_id,
                 organization=organization,
                 classification=classification,
             )
-            summary.accepted_salons += 1
+            if classification.accepted:
+                summary.accepted_salons += 1
+            else:
+                summary.rejected_results += 1
 
             if merged:
                 summary.duplicates_merged += 1

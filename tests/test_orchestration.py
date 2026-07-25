@@ -25,6 +25,7 @@ class FakeScanner:
         max_cells_per_run: int,
         dry_run: bool,
         target_cell_ids: list[int] | None = None,
+        query_profile_name: str | None = None,
         progress_logger: object | None = None,
     ) -> None:
         del progress_logger
@@ -32,6 +33,7 @@ class FakeScanner:
         self.max_cells_per_run = max_cells_per_run
         self.dry_run = dry_run
         self.target_cell_ids = target_cell_ids
+        self.query_profile_name = query_profile_name
 
     def scan_region(self, region: dict[str, object]) -> ScanSummary:
         FakeScanner.calls += 1
@@ -463,6 +465,7 @@ class AgentPipelineTests(OrchestrationDatabaseMixin, unittest.TestCase):
             disable_export=True,
             continue_on_stage_error=False,
             cell_ids=None,
+            query_profile=None,
         )
 
         config = config_from_args(args)

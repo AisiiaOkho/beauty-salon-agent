@@ -668,6 +668,8 @@ class Database:
                     rejected_results INTEGER NOT NULL DEFAULT 0,
                     duplicates_merged INTEGER NOT NULL DEFAULT 0,
                     error TEXT,
+                    query_profile_name TEXT,
+                    query_snapshot_json TEXT,
 
                     FOREIGN KEY (region_id)
                         REFERENCES regions(id)
@@ -678,6 +680,18 @@ class Database:
                         ON DELETE CASCADE
                 )
             """)
+            self._add_column_if_missing(
+                cursor,
+                "scan_attempts",
+                "query_profile_name",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "scan_attempts",
+                "query_snapshot_json",
+                "TEXT",
+            )
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS organization_detail_results (
@@ -697,6 +711,45 @@ class Database:
                     FOREIGN KEY (salon_id)
                         REFERENCES salons(id)
                         ON DELETE SET NULL
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS query_profile_benchmark_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT,
+                    region_id INTEGER NOT NULL,
+                    cell_id INTEGER NOT NULL,
+                    full_profile_name TEXT NOT NULL,
+                    reduced_profile_name TEXT NOT NULL,
+                    full_query_snapshot_json TEXT NOT NULL,
+                    reduced_query_snapshot_json TEXT NOT NULL,
+                    full_request_count INTEGER NOT NULL DEFAULT 0,
+                    reduced_request_count INTEGER NOT NULL DEFAULT 0,
+                    full_http_statuses_json TEXT,
+                    reduced_http_statuses_json TEXT,
+                    full_meta_codes_json TEXT,
+                    reduced_meta_codes_json TEXT,
+                    full_external_ids_json TEXT NOT NULL DEFAULT '[]',
+                    reduced_external_ids_json TEXT NOT NULL DEFAULT '[]',
+                    missing_from_reduced_json TEXT NOT NULL DEFAULT '[]',
+                    extra_in_reduced_json TEXT NOT NULL DEFAULT '[]',
+                    accepted_missing_from_reduced_json TEXT NOT NULL DEFAULT '[]',
+                    rejected_missing_from_reduced_json TEXT NOT NULL DEFAULT '[]',
+                    full_duration_seconds REAL,
+                    reduced_duration_seconds REAL,
+                    jaccard_similarity REAL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    error_message TEXT,
+
+                    FOREIGN KEY (region_id)
+                        REFERENCES regions(id)
+                        ON DELETE CASCADE,
+
+                    FOREIGN KEY (cell_id)
+                        REFERENCES grid_cells(id)
+                        ON DELETE CASCADE
                 )
             """)
 
@@ -820,6 +873,14 @@ class Database:
             """)
 
             cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_salons_provider_identity
+                ON salons(external_source, external_id)
+                WHERE external_id IS NOT NULL
+                  AND trim(external_id) != ''
+            """)
+
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS
                 idx_salons_normalized_name_address
                 ON salons(normalized_name, normalized_address)
@@ -853,6 +914,12 @@ class Database:
                 CREATE INDEX IF NOT EXISTS
                 idx_detail_results_source_external
                 ON organization_detail_results(external_source, external_id)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS
+                idx_query_profile_benchmark_cell_status
+                ON query_profile_benchmark_runs(cell_id, status)
             """)
 
             cursor.execute("""
@@ -1522,6 +1589,8 @@ class Database:
         self,
         region_id: int,
         grid_cell_id: int,
+        query_profile_name: str | None = None,
+        query_snapshot: list[str] | tuple[str, ...] | None = None,
     ) -> int:
         """Create a scan attempt record for one grid cell."""
 
@@ -1531,11 +1600,20 @@ class Database:
                 INSERT INTO scan_attempts (
                     region_id,
                     grid_cell_id,
-                    status
+                    status,
+                    query_profile_name,
+                    query_snapshot_json
                 )
-                VALUES (?, ?, 'running')
+                VALUES (?, ?, 'running', ?, ?)
                 """,
-                (region_id, grid_cell_id),
+                (
+                    region_id,
+                    grid_cell_id,
+                    query_profile_name,
+                    json.dumps(list(query_snapshot or []), ensure_ascii=False)
+                    if query_snapshot is not None
+                    else None,
+                ),
             )
             attempt_id = int(cursor.lastrowid)
             connection.commit()
@@ -1592,6 +1670,105 @@ class Database:
             )
             connection.commit()
 
+    def create_query_profile_benchmark_run(
+        self,
+        *,
+        region_id: int,
+        cell_id: int,
+        full_profile_name: str,
+        reduced_profile_name: str,
+        full_query_snapshot: list[str] | tuple[str, ...],
+        reduced_query_snapshot: list[str] | tuple[str, ...],
+    ) -> int:
+        """Create one paired query-profile benchmark audit row."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO query_profile_benchmark_runs (
+                    region_id,
+                    cell_id,
+                    full_profile_name,
+                    reduced_profile_name,
+                    full_query_snapshot_json,
+                    reduced_query_snapshot_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    region_id,
+                    cell_id,
+                    full_profile_name,
+                    reduced_profile_name,
+                    json.dumps(list(full_query_snapshot), ensure_ascii=False),
+                    json.dumps(list(reduced_query_snapshot), ensure_ascii=False),
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+            connection.commit()
+
+        return run_id
+
+    def complete_query_profile_benchmark_run(
+        self,
+        benchmark_run_id: int,
+        metrics: dict[str, Any],
+    ) -> None:
+        """Complete one paired query-profile benchmark audit row."""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE query_profile_benchmark_runs
+                SET
+                    finished_at = CURRENT_TIMESTAMP,
+                    full_request_count = :full_request_count,
+                    reduced_request_count = :reduced_request_count,
+                    full_http_statuses_json = :full_http_statuses_json,
+                    reduced_http_statuses_json = :reduced_http_statuses_json,
+                    full_meta_codes_json = :full_meta_codes_json,
+                    reduced_meta_codes_json = :reduced_meta_codes_json,
+                    full_external_ids_json = :full_external_ids_json,
+                    reduced_external_ids_json = :reduced_external_ids_json,
+                    missing_from_reduced_json = :missing_from_reduced_json,
+                    extra_in_reduced_json = :extra_in_reduced_json,
+                    accepted_missing_from_reduced_json = :accepted_missing_from_reduced_json,
+                    rejected_missing_from_reduced_json = :rejected_missing_from_reduced_json,
+                    full_duration_seconds = :full_duration_seconds,
+                    reduced_duration_seconds = :reduced_duration_seconds,
+                    jaccard_similarity = :jaccard_similarity,
+                    status = 'complete',
+                    error_message = NULL
+                WHERE id = :benchmark_run_id
+                """,
+                {
+                    **metrics,
+                    "benchmark_run_id": benchmark_run_id,
+                },
+            )
+            connection.commit()
+
+    def fail_query_profile_benchmark_run(
+        self,
+        benchmark_run_id: int,
+        error: str,
+    ) -> None:
+        """Mark a paired query-profile benchmark row failed."""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE query_profile_benchmark_runs
+                SET
+                    finished_at = CURRENT_TIMESTAMP,
+                    status = 'failed',
+                    error_message = ?
+                WHERE id = ?
+                """,
+                (error, benchmark_run_id),
+            )
+            connection.commit()
+
     def save_raw_organization_result(
         self,
         region_id: int,
@@ -1637,7 +1814,7 @@ class Database:
         classification: ClassificationResult,
     ) -> tuple[int, bool]:
         """
-        Insert or merge an accepted salon.
+        Insert or merge a canonical provider organization.
 
         Returns (salon_id, merged_existing).
         """
@@ -1731,7 +1908,7 @@ class Database:
                     :business_profile,
                     :classifier_decision_name,
                     :classifier_decision_categories,
-                    1,
+                    :manicure_confirmed,
                     'not_checked',
                     :raw_payload,
                     :source_url,
@@ -1937,7 +2114,7 @@ class Database:
             "categories": json.dumps(organization.categories, ensure_ascii=False),
             "description": organization.description,
             "salon_type": classification.salon_type,
-            "filter_status": "accepted",
+            "filter_status": "accepted" if classification.accepted else "rejected",
             "filter_confidence": classification.confidence,
             "filter_reasons": json.dumps(
                 classification.reasons,
@@ -1954,6 +2131,7 @@ class Database:
                 classification.decision_categories,
                 ensure_ascii=False,
             ),
+            "manicure_confirmed": 1 if classification.accepted else 0,
             "raw_payload": json.dumps(
                 organization.raw_payload,
                 ensure_ascii=False,
@@ -1999,7 +2177,7 @@ class Database:
                     business_profile = :business_profile,
                     classifier_decision_name = :classifier_decision_name,
                     classifier_decision_categories = :classifier_decision_categories,
-                    manicure_confirmed = 1,
+                    manicure_confirmed = :manicure_confirmed,
                     raw_payload = :raw_payload,
                     source_url = COALESCE(:source_url, source_url),
                     first_seen_at = COALESCE(first_seen_at, :fetched_at),

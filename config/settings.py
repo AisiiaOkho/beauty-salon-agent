@@ -61,6 +61,16 @@ SEARCH_QUERIES = [
     "nail studio",
 ]
 
+QUERY_PROFILES = {
+    "full_v1": SEARCH_QUERIES,
+    "reduced_ru_en_v1": [
+        "маникюр",
+        "nail studio",
+    ],
+}
+
+DEFAULT_QUERY_PROFILE = "full_v1"
+
 # ================================
 # Повторы
 # ================================

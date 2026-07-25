@@ -29,6 +29,10 @@ def parse_args() -> argparse.Namespace:
         "--cell-ids",
         help="Comma-separated ordered grid cell id allowlist for controlled pilots.",
     )
+    parser.add_argument(
+        "--query-profile",
+        help="Named scanner query profile. Defaults to full_v1.",
+    )
     parser.add_argument("--max-cells", type=int)
     parser.add_argument("--max-enrichments", type=int)
     parser.add_argument("--max-price-checks", type=int)
@@ -70,6 +74,7 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
         dry_run=dry_run,
         region_id=args.region_id,
         target_cell_ids=target_cell_ids,
+        query_profile_name=args.query_profile,
     )
     values = config.snapshot()
 
