@@ -107,6 +107,27 @@ Pricing writes append-only audit rows to `price_check_results` and maintains
 the current active target price in `salon_prices`. If no reliable target price
 is found, it records a clear `not_found` result rather than guessing.
 
+## Global Orchestration
+
+Module 8 adds a dry-run-first orchestration CLI that coordinates existing
+modules in the production order without rewriting their internals:
+
+```bash
+python3 src/run_agent.py --dry-run --region-id 1
+```
+
+Controlled live runs require `--live` explicitly:
+
+```bash
+python3 src/run_agent.py --live --region-id 1 --max-cells 1 \
+  --enable-scanning --enable-reclassification \
+  --disable-enrichment --disable-pricing --disable-export
+```
+
+The orchestrator records live runs in `agent_runs`, uses a SQLite lock in
+`agent_locks`, skips completed cells, reuses complete grids, and leaves regions
+`in_progress` when a run stops at its configured cell limit.
+
 ## Boundary Cache
 
 Boundaries are cached as GeoJSON-like JSON files in:

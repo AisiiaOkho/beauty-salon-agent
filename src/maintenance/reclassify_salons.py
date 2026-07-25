@@ -66,12 +66,16 @@ class SalonReclassifier:
     def reclassify(
         self,
         salon_id: int | None = None,
+        only_missing_current_version: bool = False,
     ) -> ReclassificationSummary:
         """Reclassify selected existing salon rows."""
 
         rows = self.database.get_salons_for_reclassification(
             max_records=self.max_records_per_run,
             salon_id=salon_id,
+            missing_classifier_version=(
+                self.classifier_version if only_missing_current_version else None
+            ),
         )
         summary = ReclassificationSummary(dry_run=self.dry_run)
 

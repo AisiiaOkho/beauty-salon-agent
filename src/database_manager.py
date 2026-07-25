@@ -417,6 +417,135 @@ class Database:
                         ON DELETE SET NULL
                 )
             """)
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "finished_at",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "current_stage",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "dry_run",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "configuration_snapshot_json",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "cells_attempted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "cells_completed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "cells_failed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "organizations_observed",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "salons_created",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "salons_updated",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "salons_accepted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "salons_rejected",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "enrichments_attempted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "enrichments_succeeded",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "price_checks_attempted",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "prices_found",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "export_path",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "error_stage",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "error_message",
+                "TEXT",
+            )
+            self._add_column_if_missing(
+                cursor,
+                "agent_runs",
+                "resume_token",
+                "TEXT",
+            )
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS agent_locks (
+                    lock_name TEXT PRIMARY KEY,
+                    owner TEXT NOT NULL,
+                    acquired_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TEXT NOT NULL
+                )
+            """)
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS grid_generations (
@@ -1663,6 +1792,7 @@ class Database:
                 SELECT COUNT(*) AS total
                 FROM salons
                 WHERE region_id = ?
+                  AND filter_status = 'accepted'
                 """,
                 (region_id,),
             ).fetchone()
@@ -1910,16 +2040,24 @@ class Database:
         self,
         max_records: int,
         salon_id: int | None = None,
+        missing_classifier_version: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return salon rows with preserved classifier input fields."""
 
         parameters: list[Any] = []
-        where_clause = ""
+        where_parts: list[str] = []
 
         if salon_id is not None:
-            where_clause = "WHERE id = ?"
+            where_parts.append("id = ?")
             parameters.append(salon_id)
 
+        if missing_classifier_version is not None:
+            where_parts.append(
+                "(classifier_version IS NULL OR classifier_version != ?)"
+            )
+            parameters.append(missing_classifier_version)
+
+        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         parameters.append(max_records)
 
         with self.connect() as connection:
@@ -2387,6 +2525,32 @@ class Database:
 
         return payloads
 
+    def count_pricing_eligible_salons(self) -> int:
+        """Count accepted salons with an attributable pricing source."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(DISTINCT s.id) AS total
+                FROM salons s
+                LEFT JOIN salon_contacts sc
+                    ON sc.salon_id = s.id
+                   AND sc.is_active = 1
+                   AND sc.contact_type = 'website'
+                LEFT JOIN organization_detail_results od
+                    ON od.salon_id = s.id
+                   AND od.status = 'success'
+                WHERE s.filter_status = 'accepted'
+                  AND (
+                    s.website IS NOT NULL
+                    OR sc.id IS NOT NULL
+                    OR od.id IS NOT NULL
+                  )
+                """
+            ).fetchone()
+
+        return int(row["total"])
+
     def save_price_check_result(
         self,
         result: PriceExtractionResult,
@@ -2641,6 +2805,415 @@ class Database:
 
         prefix = "от " if result.price_type == "from" else ""
         return f"{prefix}{result.amount_minor // 100}"
+
+    def peek_next_region(
+        self,
+        region_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a candidate region without mutating region state."""
+
+        with self.connect() as connection:
+            if region_id is not None:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM regions
+                    WHERE id = ?
+                    """,
+                    (region_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM regions
+                    WHERE status IN ('in_progress', 'pending')
+                    ORDER BY
+                        CASE
+                            WHEN status = 'in_progress' THEN 0
+                            ELSE 1
+                        END,
+                        scan_order
+                    LIMIT 1
+                    """
+                ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def claim_region_for_agent(
+        self,
+        region_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically claim a pending/in-progress region for orchestration."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if region_id is not None:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM regions
+                    WHERE id = ?
+                    """,
+                    (region_id,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM regions
+                    WHERE status IN ('in_progress', 'pending')
+                    ORDER BY
+                        CASE
+                            WHEN status = 'in_progress' THEN 0
+                            ELSE 1
+                        END,
+                        scan_order
+                    LIMIT 1
+                    """
+                ).fetchone()
+
+            region = dict(row) if row is not None else None
+
+            if region is None:
+                connection.commit()
+                return None
+
+            if region["status"] == "completed":
+                connection.commit()
+                return None
+
+            if region["status"] == "pending":
+                connection.execute(
+                    """
+                    UPDATE regions
+                    SET
+                        status = 'in_progress',
+                        started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
+                    WHERE id = ?
+                    """,
+                    (region["id"],),
+                )
+
+            connection.commit()
+
+        return self.get_region_progress(int(region["id"]))
+
+    def get_region_cell_status_counts(self, region_id: int) -> dict[str, int]:
+        """Return grid-cell counts grouped by status."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS total
+                FROM grid_cells
+                WHERE region_id = ?
+                GROUP BY status
+                """,
+                (region_id,),
+            ).fetchall()
+
+        return {str(row["status"]): int(row["total"]) for row in rows}
+
+    def get_next_pending_cell_preview(self, region_id: int) -> dict[str, Any] | None:
+        """Return the next pending grid cell without claiming it."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM grid_cells
+                WHERE region_id = ?
+                  AND status = 'pending'
+                ORDER BY cell_order
+                LIMIT 1
+                """,
+                (region_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def recover_stale_agent_runs(self, stale_minutes: int) -> int:
+        """Mark old running agent runs as interrupted."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE agent_runs
+                SET
+                    status = 'interrupted',
+                    finished_at = CURRENT_TIMESTAMP,
+                    error_message = COALESCE(error_message, 'stale run recovered')
+                WHERE status = 'running'
+                  AND datetime(started_at, '+' || ? || ' minutes') < CURRENT_TIMESTAMP
+                """,
+                (stale_minutes,),
+            )
+            connection.commit()
+
+        return int(cursor.rowcount)
+
+    def acquire_agent_lock(
+        self,
+        lock_name: str,
+        owner: str,
+        stale_minutes: int,
+    ) -> bool:
+        """Acquire a SQLite lock, replacing only expired lock rows."""
+
+        with self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT owner, expires_at
+                FROM agent_locks
+                WHERE lock_name = ?
+                """,
+                (lock_name,),
+            ).fetchone()
+
+            if row is not None:
+                expired = connection.execute(
+                    """
+                    SELECT datetime(?) <= CURRENT_TIMESTAMP AS expired
+                    """,
+                    (row["expires_at"],),
+                ).fetchone()
+
+                if int(expired["expired"]) != 1:
+                    connection.rollback()
+                    return False
+
+            connection.execute(
+                """
+                INSERT INTO agent_locks (
+                    lock_name,
+                    owner,
+                    acquired_at,
+                    expires_at
+                )
+                VALUES (
+                    ?,
+                    ?,
+                    CURRENT_TIMESTAMP,
+                    datetime(CURRENT_TIMESTAMP, '+' || ? || ' minutes')
+                )
+                ON CONFLICT(lock_name)
+                DO UPDATE SET
+                    owner = excluded.owner,
+                    acquired_at = excluded.acquired_at,
+                    expires_at = excluded.expires_at
+                """,
+                (lock_name, owner, stale_minutes),
+            )
+            connection.commit()
+
+        return True
+
+    def release_agent_lock(self, lock_name: str, owner: str) -> None:
+        """Release a lock if it is still owned by the caller."""
+
+        with self.connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM agent_locks
+                WHERE lock_name = ?
+                  AND owner = ?
+                """,
+                (lock_name, owner),
+            )
+            connection.commit()
+
+    def create_agent_run_record(
+        self,
+        *,
+        region_id: int | None,
+        dry_run: bool,
+        configuration_snapshot: dict[str, Any],
+        owner: str,
+    ) -> int:
+        """Create one live agent run record."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO agent_runs (
+                    region_id,
+                    status,
+                    current_stage,
+                    dry_run,
+                    configuration_snapshot_json,
+                    resume_token
+                )
+                VALUES (?, 'running', 'select_region', ?, ?, ?)
+                """,
+                (
+                    region_id,
+                    1 if dry_run else 0,
+                    json.dumps(configuration_snapshot, ensure_ascii=False),
+                    owner,
+                ),
+            )
+            run_id = int(cursor.lastrowid)
+            connection.commit()
+
+        return run_id
+
+    def update_agent_run_record(
+        self,
+        run_id: int,
+        **fields: Any,
+    ) -> None:
+        """Update selected mutable agent run fields."""
+
+        if not fields:
+            return
+
+        allowed = {
+            "status",
+            "current_stage",
+            "finished_at",
+            "cells_attempted",
+            "cells_completed",
+            "cells_failed",
+            "organizations_observed",
+            "salons_created",
+            "salons_updated",
+            "salons_accepted",
+            "salons_rejected",
+            "enrichments_attempted",
+            "enrichments_succeeded",
+            "price_checks_attempted",
+            "prices_found",
+            "export_path",
+            "error_stage",
+            "error_message",
+        }
+        assignments = []
+        values: list[Any] = []
+
+        for key, value in fields.items():
+            if key not in allowed:
+                raise ValueError(f"Unsupported agent_runs field: {key}")
+
+            assignments.append(f"{key} = ?")
+            values.append(value)
+
+        values.append(run_id)
+
+        with self.connect() as connection:
+            connection.execute(
+                f"""
+                UPDATE agent_runs
+                SET {', '.join(assignments)}
+                WHERE id = ?
+                """,
+                values,
+            )
+            connection.commit()
+
+    def finish_agent_run_record(
+        self,
+        run_id: int,
+        status: str,
+        **fields: Any,
+    ) -> None:
+        """Finish one live agent run."""
+
+        self.update_agent_run_record(run_id, status=status, **fields)
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE agent_runs
+                SET finished_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (run_id,),
+            )
+            connection.commit()
+
+    def get_agent_run(self, run_id: int) -> dict[str, Any]:
+        """Return one agent run record."""
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM agent_runs
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+
+        if row is None:
+            raise ValueError(f"Agent run with ID {run_id} not found.")
+
+        return dict(row)
+
+    def complete_region_if_terminal(self, region_id: int) -> bool:
+        """Mark region complete only when grid exists and all cells are terminal."""
+
+        generation = self.get_grid_generation(region_id)
+
+        if generation is None or generation["status"] != "complete":
+            return False
+
+        counts = self.get_region_cell_status_counts(region_id)
+
+        if counts.get("pending", 0) > 0 or counts.get("in_progress", 0) > 0:
+            return False
+
+        completed = counts.get("completed", 0)
+        total = sum(counts.values())
+
+        with self.connect() as connection:
+            accepted = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM salons
+                WHERE region_id = ?
+                  AND filter_status = 'accepted'
+                """,
+                (region_id,),
+            ).fetchone()
+            rejected = connection.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM salons
+                WHERE region_id = ?
+                  AND filter_status = 'rejected'
+                """,
+                (region_id,),
+            ).fetchone()
+            connection.execute(
+                """
+                UPDATE regions
+                SET
+                    status = 'completed',
+                    completed_at = CURRENT_TIMESTAMP,
+                    total_cells = ?,
+                    completed_cells = ?,
+                    salons_found = ?,
+                    comment = ?
+                WHERE id = ?
+                """,
+                (
+                    total,
+                    completed,
+                    int(accepted["total"]),
+                    f"Rejected salons: {int(rejected['total'])}; failed cells: {counts.get('failed', 0)}",
+                    region_id,
+                ),
+            )
+            connection.commit()
+
+        return True
 
     def get_table_names(self) -> list[str]:
         with self.connect() as connection:
