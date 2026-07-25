@@ -32,6 +32,7 @@ class SalonScannerManager:
         max_pages_per_query: int = TWOGIS_MAX_PAGES_PER_QUERY,
         retry_limit: int = SCANNER_CELL_RETRY_LIMIT,
         dry_run: bool = SCANNER_DRY_RUN,
+        target_cell_ids: list[int] | None = None,
         progress_logger: ProgressLogger | None = None,
     ) -> None:
         if max_cells_per_run < 0:
@@ -46,6 +47,7 @@ class SalonScannerManager:
         self.max_pages_per_query = max_pages_per_query
         self.retry_limit = retry_limit
         self.dry_run = dry_run
+        self.target_cell_ids = target_cell_ids
         self.progress_logger = progress_logger or print
         self.search_client = search_client
 
@@ -80,6 +82,7 @@ class SalonScannerManager:
             cell = self.database.start_next_grid_cell_scan(
                 region_id=region_id,
                 retry_limit=self.retry_limit,
+                eligible_cell_ids=self.target_cell_ids,
             )
 
             if cell is None:

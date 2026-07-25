@@ -25,6 +25,10 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--live", action="store_true")
     parser.add_argument("--region-id", type=int)
+    parser.add_argument(
+        "--cell-ids",
+        help="Comma-separated ordered grid cell id allowlist for controlled pilots.",
+    )
     parser.add_argument("--max-cells", type=int)
     parser.add_argument("--max-enrichments", type=int)
     parser.add_argument("--max-price-checks", type=int)
@@ -53,7 +57,20 @@ def config_from_args(args: argparse.Namespace) -> AgentConfig:
     elif args.dry_run:
         dry_run = True
 
-    config = AgentConfig(dry_run=dry_run, region_id=args.region_id)
+    target_cell_ids = None
+
+    if args.cell_ids:
+        target_cell_ids = [
+            int(value.strip())
+            for value in args.cell_ids.split(",")
+            if value.strip()
+        ]
+
+    config = AgentConfig(
+        dry_run=dry_run,
+        region_id=args.region_id,
+        target_cell_ids=target_cell_ids,
+    )
     values = config.snapshot()
 
     if args.max_cells is not None:

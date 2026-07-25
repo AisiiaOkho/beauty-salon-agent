@@ -1355,21 +1355,40 @@ class Database:
         self,
         region_id: int,
         retry_limit: int,
+        eligible_cell_ids: list[int] | None = None,
     ) -> dict[str, Any] | None:
         """Select and mark the next pending/retryable grid cell in progress."""
 
         with self.connect() as connection:
+            eligible_clause = ""
+            order_clause = "cell_order"
+            parameters: list[object] = [region_id, retry_limit]
+
+            if eligible_cell_ids is not None:
+                if not eligible_cell_ids:
+                    return None
+
+                placeholders = ",".join("?" for _ in eligible_cell_ids)
+                eligible_clause = f"AND id IN ({placeholders})"
+                order_cases = " ".join(
+                    f"WHEN {int(cell_id)} THEN {index}"
+                    for index, cell_id in enumerate(eligible_cell_ids)
+                )
+                order_clause = f"CASE id {order_cases} ELSE {len(eligible_cell_ids)} END"
+                parameters.extend(eligible_cell_ids)
+
             row = connection.execute(
-                """
+                f"""
                 SELECT *
                 FROM grid_cells
                 WHERE region_id = ?
                   AND status = 'pending'
                   AND attempts < ?
-                ORDER BY cell_order
+                  {eligible_clause}
+                ORDER BY {order_clause}, cell_order
                 LIMIT 1
                 """,
-                (region_id, retry_limit),
+                parameters,
             ).fetchone()
 
             if row is None:
@@ -2932,6 +2951,42 @@ class Database:
                 LIMIT 1
                 """,
                 (region_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return dict(row)
+
+    def get_next_pending_cell_preview_from_ids(
+        self,
+        region_id: int,
+        eligible_cell_ids: list[int],
+    ) -> dict[str, Any] | None:
+        """Return the next pending grid cell from an ordered allowlist."""
+
+        if not eligible_cell_ids:
+            return None
+
+        placeholders = ",".join("?" for _ in eligible_cell_ids)
+        order_cases = " ".join(
+            f"WHEN {int(cell_id)} THEN {index}"
+            for index, cell_id in enumerate(eligible_cell_ids)
+        )
+
+        with self.connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT *
+                FROM grid_cells
+                WHERE region_id = ?
+                  AND status = 'pending'
+                  AND id IN ({placeholders})
+                ORDER BY CASE id {order_cases} ELSE {len(eligible_cell_ids)} END,
+                         cell_order
+                LIMIT 1
+                """,
+                [region_id, *eligible_cell_ids],
             ).fetchone()
 
         if row is None:

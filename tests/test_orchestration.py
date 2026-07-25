@@ -24,12 +24,14 @@ class FakeScanner:
         database: Database,
         max_cells_per_run: int,
         dry_run: bool,
+        target_cell_ids: list[int] | None = None,
         progress_logger: object | None = None,
     ) -> None:
         del progress_logger
         self.database = database
         self.max_cells_per_run = max_cells_per_run
         self.dry_run = dry_run
+        self.target_cell_ids = target_cell_ids
 
     def scan_region(self, region: dict[str, object]) -> ScanSummary:
         FakeScanner.calls += 1
@@ -39,6 +41,7 @@ class FakeScanner:
             cell = self.database.start_next_grid_cell_scan(
                 int(region["id"]),
                 retry_limit=3,
+                eligible_cell_ids=self.target_cell_ids,
             )
 
             if cell is None:
@@ -171,6 +174,24 @@ class AgentPipelineTests(OrchestrationDatabaseMixin, unittest.TestCase):
             self.assertEqual(first.cells_attempted, 1)
             self.assertEqual(second.cells_attempted, 1)
             self.assertEqual(counts.get("completed"), 2)
+
+    def test_target_cell_allowlist_controls_selection_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = self.make_database(directory, cell_count=4)
+            config = AgentConfig(
+                dry_run=False,
+                region_id=1,
+                target_cell_ids=[3, 2],
+                max_cells_per_run=1,
+                enable_reclassification=False,
+            )
+
+            with patch("orchestration.pipeline.SalonScannerManager", FakeScanner):
+                AgentPipeline(database, config).run()
+
+            self.assertEqual(database.get_grid_cell(3)["status"], "completed")
+            self.assertEqual(database.get_grid_cell(1)["status"], "pending")
+            self.assertEqual(database.get_grid_cell(2)["status"], "pending")
 
     def test_region_not_completed_after_partial_scan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -441,6 +462,7 @@ class AgentPipelineTests(OrchestrationDatabaseMixin, unittest.TestCase):
             enable_export=False,
             disable_export=True,
             continue_on_stage_error=False,
+            cell_ids=None,
         )
 
         config = config_from_args(args)

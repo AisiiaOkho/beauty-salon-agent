@@ -28,6 +28,7 @@ class AgentConfig:
 
     dry_run: bool = AGENT_DRY_RUN
     region_id: int | None = None
+    target_cell_ids: list[int] | None = None
     max_regions_per_run: int = AGENT_MAX_REGIONS_PER_RUN
     max_cells_per_run: int = AGENT_MAX_CELLS_PER_RUN
     max_enrichments_per_run: int = AGENT_MAX_ENRICHMENTS_PER_RUN

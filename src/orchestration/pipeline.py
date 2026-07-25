@@ -83,8 +83,20 @@ class AgentPipeline:
 
         region_id = int(region["id"])
         generation = self.database.get_grid_generation(region_id)
-        next_cell = self.database.get_next_pending_cell_preview(region_id)
+        next_cell = (
+            self.database.get_next_pending_cell_preview_from_ids(
+                region_id,
+                self.config.target_cell_ids,
+            )
+            if self.config.target_cell_ids
+            else self.database.get_next_pending_cell_preview(region_id)
+        )
         cell_counts = self.database.get_region_cell_status_counts(region_id)
+        pending_for_run = (
+            self._pending_target_cell_count(region_id)
+            if self.config.target_cell_ids
+            else cell_counts.get("pending", 0)
+        )
         summary.region_id = region_id
         summary.region_name = str(region["name"])
         summary.remaining_pending_cells = cell_counts.get("pending", 0)
@@ -103,7 +115,7 @@ class AgentPipeline:
                 StageResult(
                     "scan_cells",
                     status="would_run" if self.config.enable_scanning and next_cell else "would_skip",
-                    attempted=min(self.config.max_cells_per_run, cell_counts.get("pending", 0)),
+                    attempted=min(self.config.max_cells_per_run, pending_for_run),
                     metrics={
                         "next_cell_id": next_cell["id"] if next_cell else None,
                         "next_cell_order": next_cell["cell_order"] if next_cell else None,
@@ -244,6 +256,7 @@ class AgentPipeline:
             self.database,
             max_cells_per_run=self.config.max_cells_per_run,
             dry_run=False,
+            target_cell_ids=self.config.target_cell_ids,
             progress_logger=self.progress_logger,
         )
         scan_summary = scanner.scan_region(region)
@@ -398,3 +411,23 @@ class AgentPipeline:
             "prices_found": summary.prices_found,
             "export_path": summary.export_path,
         }
+
+    def _pending_target_cell_count(self, region_id: int) -> int:
+        if not self.config.target_cell_ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in self.config.target_cell_ids)
+
+        with self.database.connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT COUNT(*) AS total
+                FROM grid_cells
+                WHERE region_id = ?
+                  AND status = 'pending'
+                  AND id IN ({placeholders})
+                """,
+                [region_id, *self.config.target_cell_ids],
+            ).fetchone()
+
+        return int(row["total"])
